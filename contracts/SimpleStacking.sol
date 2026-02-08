@@ -121,7 +121,7 @@ contract SimpleStaking is ReentrancyGuard, Ownable {
         emit Staked(msg.sender, amount);
     }
     
-    function withdraw(uint256 amount) external nonReentrant updateReward(msg.sender) {
+    function withdraw(uint256 amount) public nonReentrant updateReward(msg.sender) {
         require(amount > 0, "Cannot withdraw 0");
         require(balances[msg.sender] >= amount, "Insufficient staked balance");
         require(

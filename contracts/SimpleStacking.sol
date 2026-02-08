@@ -18,8 +18,10 @@ contract SimpleStaking is ReentrancyGuard, Ownable {
     uint256 public lastUpdateTime;
     uint256 public rewardPerTokenStored;
     uint256 public totalStaked;
+    uint256 public periodFinish; // When the reward period ends
     
     uint256 private constant PRECISION = 1e18;
+    uint256 public constant REWARD_DURATION = 30 days;
     
     // Minimum staking period (in seconds)
     uint256 public constant MIN_STAKING_PERIOD = 7 days;
@@ -35,6 +37,7 @@ contract SimpleStaking is ReentrancyGuard, Ownable {
     event Withdrawn(address indexed user, uint256 amount);
     event RewardPaid(address indexed user, uint256 reward);
     event RewardRateUpdated(uint256 newRate);
+    event RewardAdded(uint256 reward);
     
     // ========== MODIFIERS ==========
     modifier updateReward(address account) {
@@ -61,11 +64,12 @@ contract SimpleStaking is ReentrancyGuard, Ownable {
         rewardToken = IERC20(_rewardToken);
         rewardRate = _rewardRate;
         lastUpdateTime = block.timestamp;
+        periodFinish = block.timestamp + REWARD_DURATION;
     }
     
     // ========== VIEW FUNCTIONS ==========
     function lastTimeRewardApplicable() public view returns (uint256) {
-        return Math.min(block.timestamp, lastUpdateTime + 30 days); // Max reward period
+        return Math.min(block.timestamp, periodFinish);
     }
     
     function rewardPerToken() public view returns (uint256) {
@@ -93,13 +97,16 @@ contract SimpleStaking is ReentrancyGuard, Ownable {
         if (lastStakeTime[account] == 0) return 0;
         return block.timestamp - lastStakeTime[account];
     }
+
+    function getStakedBalance(address account) external view returns (uint256) {
+        return balances[account];
+    }
     
     // ========== STAKING FUNCTIONS ==========
     function stake(uint256 amount) external nonReentrant updateReward(msg.sender) {
         require(amount > 0, "Cannot stake 0");
-        require(stakingToken.balanceOf(msg.sender) >= amount, "Insufficient balance");
         
-        // Update staking time
+        // Update staking time only on first stake
         if (balances[msg.sender] == 0) {
             lastStakeTime[msg.sender] = block.timestamp;
         }
@@ -118,7 +125,7 @@ contract SimpleStaking is ReentrancyGuard, Ownable {
         require(amount > 0, "Cannot withdraw 0");
         require(balances[msg.sender] >= amount, "Insufficient staked balance");
         require(
-            block.timestamp - lastStakeTime[msg.sender] >= MIN_STAKING_PERIOD,
+            block.timestamp >= lastStakeTime[msg.sender] + MIN_STAKING_PERIOD,
             "Minimum staking period not met"
         );
         
@@ -126,22 +133,23 @@ contract SimpleStaking is ReentrancyGuard, Ownable {
         balances[msg.sender] -= amount;
         totalStaked -= amount;
         
+        // Reset lastStakeTime if fully withdrawn
+        if (balances[msg.sender] == 0) {
+            lastStakeTime[msg.sender] = 0;
+        }
+        
         // Transfer token back to user
         stakingToken.safeTransfer(msg.sender, amount);
         
         emit Withdrawn(msg.sender, amount);
     }
     
-    function getReward() external nonReentrant updateReward(msg.sender) {
+    function getReward() public nonReentrant updateReward(msg.sender) {
         uint256 reward = rewards[msg.sender];
         if (reward > 0) {
             rewards[msg.sender] = 0;
             
             // Transfer reward to user
-            require(
-                rewardToken.balanceOf(address(this)) >= reward,
-                "Insufficient reward balance"
-            );
             rewardToken.safeTransfer(msg.sender, reward);
             
             emit RewardPaid(msg.sender, reward);
@@ -149,32 +157,47 @@ contract SimpleStaking is ReentrancyGuard, Ownable {
     }
     
     function exit() external {
-        withdraw(balances[msg.sender]);
+        require(balances[msg.sender] > 0, "No staked balance");
+        require(
+            block.timestamp >= lastStakeTime[msg.sender] + MIN_STAKING_PERIOD,
+            "Minimum staking period not met"
+        );
+        
+        uint256 amount = balances[msg.sender];
+        withdraw(amount);
         getReward();
     }
     
     // ========== ADMIN FUNCTIONS ==========
-    function notifyRewardAmount(uint256 amount) external onlyOwner updateReward(address(0)) {
-        require(amount > 0, "Cannot notify 0 reward");
-        require(rewardToken.balanceOf(msg.sender) >= amount, "Insufficient reward balance");
+    function notifyRewardAmount(uint256 reward) external onlyOwner updateReward(address(0)) {
+        require(reward > 0, "Cannot notify 0 reward");
         
-        rewardToken.safeTransferFrom(msg.sender, address(this), amount);
+        // Transfer reward tokens to contract
+        rewardToken.safeTransferFrom(msg.sender, address(this), reward);
         
-        uint256 currentRewardPerSecond = rewardRate;
-        uint256 newRewardRate = amount / 30 days; // Distribute over 30 days
-        
-        if (block.timestamp >= lastUpdateTime + 30 days) {
-            rewardRate = newRewardRate;
+        if (block.timestamp >= periodFinish) {
+            rewardRate = reward / REWARD_DURATION;
         } else {
-            uint256 remaining = rewardRate * (lastUpdateTime + 30 days - block.timestamp);
-            rewardRate = (remaining + amount) / 30 days;
+            uint256 remaining = periodFinish - block.timestamp;
+            uint256 leftover = remaining * rewardRate;
+            rewardRate = (reward + leftover) / REWARD_DURATION;
         }
         
+        // Ensure reward rate is valid
+        require(rewardRate > 0, "Reward rate too low");
+        require(
+            rewardRate <= rewardToken.balanceOf(address(this)) / REWARD_DURATION,
+            "Provided reward too high"
+        );
+        
         lastUpdateTime = block.timestamp;
+        periodFinish = block.timestamp + REWARD_DURATION;
+        
+        emit RewardAdded(reward);
         emit RewardRateUpdated(rewardRate);
     }
     
-    function updateRewardRate(uint256 _rewardRate) external onlyOwner {
+    function updateRewardRate(uint256 _rewardRate) external onlyOwner updateReward(address(0)) {
         require(_rewardRate > 0, "Reward rate must be > 0");
         rewardRate = _rewardRate;
         emit RewardRateUpdated(_rewardRate);
@@ -185,5 +208,15 @@ contract SimpleStaking is ReentrancyGuard, Ownable {
         require(tokenAddress != address(rewardToken), "Cannot withdraw reward token");
         
         IERC20(tokenAddress).safeTransfer(owner(), tokenAmount);
+    }
+
+    // Emergency function to recover stuck reward tokens (only after period finish)
+    function recoverExcessRewardTokens() external onlyOwner {
+        require(block.timestamp > periodFinish, "Reward period not finished");
+        
+        uint256 excessRewards = rewardToken.balanceOf(address(this));
+        if (excessRewards > 0) {
+            rewardToken.safeTransfer(owner(), excessRewards);
+        }
     }
 }

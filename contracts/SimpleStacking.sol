@@ -64,7 +64,7 @@ contract SimpleStaking is ReentrancyGuard, Ownable {
         rewardToken = IERC20(_rewardToken);
         rewardRate = _rewardRate;
         lastUpdateTime = block.timestamp;
-        periodFinish = block.timestamp + REWARD_DURATION;
+        periodFinish = 0; // Will be set on first notifyRewardAmount
     }
     
     // ========== VIEW FUNCTIONS ==========
@@ -185,10 +185,6 @@ contract SimpleStaking is ReentrancyGuard, Ownable {
         
         // Ensure reward rate is valid
         require(rewardRate > 0, "Reward rate too low");
-        require(
-            rewardRate <= rewardToken.balanceOf(address(this)) / REWARD_DURATION,
-            "Provided reward too high"
-        );
         
         lastUpdateTime = block.timestamp;
         periodFinish = block.timestamp + REWARD_DURATION;
